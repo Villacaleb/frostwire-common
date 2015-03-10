@@ -28,6 +28,10 @@ import javax.jmdns.ServiceEvent;
 import javax.jmdns.ServiceInfo;
 import javax.jmdns.ServiceListener;
 
+import com.frostwire.bittorrent.BTEngine;
+import com.frostwire.jlibtorrent.AlertListener;
+import com.frostwire.jlibtorrent.Session;
+import com.frostwire.jlibtorrent.alerts.*;
 import com.frostwire.logging.Logger;
 import com.frostwire.util.JsonUtils;
 
@@ -56,11 +60,120 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
     private ServiceInfo serviceInfo;
     private LocalPeerManagerListener listener;
 
+    private AlertListener portMappingListener;
+    private int tcpMappingHandle;
+    private int udpMappingHandle;
+
     public LocalPeerManagerImpl(MulticastLock lock) {
         this.lock = lock;
-
         this.serviceListener = new JmDNSServiceListener();
         this.cache = new ConcurrentHashMap<String, LocalPeer>();
+        this.portMappingListener = createPortMappingListener();
+    }
+
+
+
+    @Override
+    public void start(LocalPeer peer) {
+        start(null, peer);
+    }
+
+    @Override
+    public void stop() {
+        try {
+            if (jmdns != null) {
+
+                triggerLocalServiceRemoved();
+
+                jmdns.removeServiceListener(SERVICE_TYPE, serviceListener);
+                jmdns.unregisterAllServices();
+
+                try {
+                    jmdns.close();
+                } catch (IOException e) {
+                    LOG.error("Error closing JmDNS", e);
+                }
+
+                jmdns = null;
+            }
+
+            cache.clear();
+
+            if (lock != null) {
+                try {
+                    lock.release();
+                } catch (RuntimeException re) {
+                    LOG.error("RuntimeException caught: Could not release multicast lock", re);
+                }
+            }
+
+            unnanouncePortMapAlert();
+            BTEngine.getInstance().getSession().removeListener(this.portMappingListener);
+        } catch (Throwable e) {
+            LOG.error("Error stopping local peer manager", e);
+        }
+    }
+
+    @Override
+    public void update(LocalPeer peer) {
+        try {
+            if (jmdns != null) {
+                serviceInfo.setText(createProps(peer, jmdns));
+            }
+        } catch (Throwable e) {
+            LOG.error("Error refreshing local peer manager", e);
+        }
+    }
+
+    private AlertListener createPortMappingListener() {
+        return new AlertListener() {
+
+            private final int[] alertTypes = new int[] { AlertType.PORTMAP.getSwig(), AlertType.PORTMAP_LOG.getSwig() };
+
+            @Override
+            public int[] types() {
+                return alertTypes;
+            }
+
+            @Override
+            public void alert(Alert<?> alert) {
+                int type = alert.getType().getSwig();
+                if(AlertType.PORTMAP.getSwig() == type) {
+                    PortmapAlert portmapAlert = (PortmapAlert) alert;
+                    System.out.println("Got PortMapAlert!");
+                    System.out.println(portmapAlert.toString());
+                } else if (AlertType.PORTMAP_LOG.getSwig() == type) {
+                    PortmapLogAlert portmapLogAlert = (PortmapLogAlert) alert;
+                    int mapType = portmapLogAlert.getMapType().getSwig();
+                    String mapTypeStr = mapType == 0 ? "NAT-PMP":"UPnP";
+                    int category = portmapLogAlert.getCategory();
+                    String message = portmapLogAlert.getMessage();
+                    System.out.println(mapTypeStr + " category: " + category + " message: ["+message+"]" );
+                }
+
+
+            }
+        };
+    }
+
+    public void announcePortMapAlert(LocalPeer peer) {
+        Session session = BTEngine.getInstance().getSession();
+        if (session != null) {
+            udpMappingHandle = session.addPortMapping(Session.ProtocolType.UDP, peer.port, peer.port);
+            tcpMappingHandle = session.addPortMapping(Session.ProtocolType.TCP, peer.port, peer.port);
+        }
+    }
+
+    public void unnanouncePortMapAlert() {
+        Session session = BTEngine.getInstance().getSession();
+        if (session != null) {
+            session.deletePortMapping(udpMappingHandle);
+            session.deletePortMapping(tcpMappingHandle);
+        }
+    }
+
+    public void listenToPortMapAlerts() {
+        BTEngine.getInstance().getSession().addListener(this.portMappingListener);
     }
 
     public LocalPeerManagerImpl() {
@@ -104,57 +217,11 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
             serviceInfo = createService(peer, jmdns);
             jmdns.registerService(serviceInfo);
 
+            listenToPortMapAlerts();
+            announcePortMapAlert(peer);
+
         } catch (Throwable e) {
             LOG.error("Unable to start local peer manager", e);
-        }
-    }
-
-    @Override
-    public void start(LocalPeer peer) {
-        start(null, peer);
-    }
-
-    @Override
-    public void stop() {
-        try {
-            if (jmdns != null) {
-
-                triggerLocalServiceRemoved();
-
-                jmdns.removeServiceListener(SERVICE_TYPE, serviceListener);
-                jmdns.unregisterAllServices();
-
-                try {
-                    jmdns.close();
-                } catch (IOException e) {
-                    LOG.error("Error closing JmDNS", e);
-                }
-
-                jmdns = null;
-            }
-
-            cache.clear();
-
-            if (lock != null) {
-                try {
-                    lock.release();
-                } catch (RuntimeException re) {
-                    LOG.error("RuntimeException caught: Could not release multicast lock", re);
-                }
-            }
-        } catch (Throwable e) {
-            LOG.error("Error stopping local peer manager", e);
-        }
-    }
-
-    @Override
-    public void update(LocalPeer peer) {
-        try {
-            if (jmdns != null) {
-                serviceInfo.setText(createProps(peer, jmdns));
-            }
-        } catch (Throwable e) {
-            LOG.error("Error refreshing local peer manager", e);
         }
     }
 
