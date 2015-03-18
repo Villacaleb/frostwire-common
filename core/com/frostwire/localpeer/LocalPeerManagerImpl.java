@@ -22,6 +22,10 @@ import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.jmdns.JmDNS;
 import javax.jmdns.ServiceEvent;
@@ -29,6 +33,7 @@ import javax.jmdns.ServiceInfo;
 import javax.jmdns.ServiceListener;
 
 import com.frostwire.bittorrent.BTEngine;
+import com.frostwire.core.Constants;
 import com.frostwire.jlibtorrent.AlertListener;
 import com.frostwire.jlibtorrent.Session;
 import com.frostwire.jlibtorrent.alerts.*;
@@ -50,6 +55,7 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
     private static final String JMDNS_NAME = "LocalPeerManagerJmDNS";
     private static final String SERVICE_TYPE = "_fw_local_peer._tcp.local.";
     private static final String PEER_PROPERTY = "peer";
+    private static final int DISCOVERY_PERIOD_IN_SECONDS = 20;
 
     private final MulticastLock lock;
 
@@ -63,12 +69,14 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
     private AlertListener portMappingListener;
     private int tcpMappingHandle;
     private int udpMappingHandle;
+    private final AtomicBoolean deviceDiscoveryActive;
 
     public LocalPeerManagerImpl(MulticastLock lock) {
         this.lock = lock;
         this.serviceListener = new JmDNSServiceListener();
         this.cache = new ConcurrentHashMap<String, LocalPeer>();
         this.portMappingListener = createPortMappingListener();
+        this.deviceDiscoveryActive = new AtomicBoolean(false);
     }
 
 
@@ -109,9 +117,14 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
 
             unnanouncePortMapAlert();
             BTEngine.getInstance().getSession().removeListener(this.portMappingListener);
+            stopDeviceDiscovery();
         } catch (Throwable e) {
             LOG.error("Error stopping local peer manager", e);
         }
+    }
+
+    private void stopDeviceDiscovery() {
+        this.deviceDiscoveryActive.set(false);
     }
 
     @Override
@@ -128,7 +141,9 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
     private AlertListener createPortMappingListener() {
         return new AlertListener() {
 
-            private final int[] alertTypes = new int[] { AlertType.PORTMAP.getSwig(), AlertType.PORTMAP_LOG.getSwig() };
+            private Pattern ipPattern = Pattern.compile(".*?method m-search.*?(\\d+.\\d+.\\d+.\\d+)\\:1900");
+
+            private final int[] alertTypes = new int[] { AlertType.PORTMAP_LOG.getSwig() };
 
             @Override
             public int[] types() {
@@ -138,20 +153,16 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
             @Override
             public void alert(Alert<?> alert) {
                 int type = alert.getType().getSwig();
-                if(AlertType.PORTMAP.getSwig() == type) {
-                    PortmapAlert portmapAlert = (PortmapAlert) alert;
-                    System.out.println("Got PortMapAlert!");
-                    System.out.println(portmapAlert.toString());
-                } else if (AlertType.PORTMAP_LOG.getSwig() == type) {
+                if (AlertType.PORTMAP_LOG.getSwig() == type) {
                     PortmapLogAlert portmapLogAlert = (PortmapLogAlert) alert;
-                    int mapType = portmapLogAlert.getMapType().getSwig();
-                    String mapTypeStr = mapType == 0 ? "NAT-PMP":"UPnP";
-                    int category = portmapLogAlert.getCategory();
                     String message = portmapLogAlert.getMessage();
-                    System.out.println(mapTypeStr + " category: " + category + " message: ["+message+"]" );
+                    final Matcher matcher = ipPattern.matcher(message);
+                    if (matcher.find()) {
+                        String ip = matcher.group(1);
+                        LocalPeer peer = new LocalPeer(ip, Constants.EXTERNAL_CONTROL_LISTENING_PORT,true,"n/a",0,-1,"n/a");
+                        System.out.println("LocalPeerManagerImpl: Local peer at " + ip);
+                    }
                 }
-
-
             }
         };
     }
@@ -219,10 +230,31 @@ public final class LocalPeerManagerImpl implements LocalPeerManager {
 
             listenToPortMapAlerts();
             announcePortMapAlert(peer);
+            startDeviceDiscovery();
 
         } catch (Throwable e) {
             LOG.error("Unable to start local peer manager", e);
         }
+    }
+
+    private void startDeviceDiscovery() {
+        this.deviceDiscoveryActive.set(true);
+
+        new Thread("LocalPeerManagerImpl-deviceDiscovery") {
+            @Override
+            public void run() {
+                final Session session = BTEngine.getInstance().getSession();
+
+                while (deviceDiscoveryActive.get()) {
+                     session.getUPnP().discoverDevice();
+                    try {
+                        TimeUnit.SECONDS.sleep(DISCOVERY_PERIOD_IN_SECONDS);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        }.start();
     }
 
     private ServiceInfo createService(LocalPeer peer, JmDNS jmdns) {
