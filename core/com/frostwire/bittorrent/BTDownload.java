@@ -316,10 +316,15 @@ public final class BTDownload extends TorrentAlertAdapter implements BittorrentD
         th.saveResumeData();
     }
 
+    /** Resumes in auto managed mode */
     public void resume() {
+        resume(true);
+    }
+
+    public void resume(boolean automanage) {
         extra.put(WAS_PAUSED_EXTRA_KEY, Boolean.FALSE.toString());
 
-        th.setAutoManaged(true);
+        th.setAutoManaged(automanage);
         th.resume();
         th.saveResumeData();
     }

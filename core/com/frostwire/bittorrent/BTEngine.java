@@ -26,14 +26,18 @@ import com.frostwire.jlibtorrent.alerts.TorrentPausedAlert;
 import com.frostwire.jlibtorrent.swig.*;
 import com.frostwire.logging.Logger;
 import com.frostwire.search.torrent.TorrentCrawledSearchResult;
+import com.frostwire.util.ByteUtils;
 import com.frostwire.util.OSUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FilenameFilter;
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static com.frostwire.jlibtorrent.alerts.AlertType.*;
@@ -635,7 +639,6 @@ public final class BTEngine {
         }
 
         migrateVuzeDownloads();
-
         runNextRestoreDownloadTask();
     }
 
@@ -869,17 +872,75 @@ public final class BTEngine {
         private final File saveDir;
         private final Priority[] priorities;
         private final File resume;
+        private boolean paused;
 
         public RestoreDownloadTask(File torrent, File saveDir, Priority[] priorities, File resume) {
             this.torrent = torrent;
             this.saveDir = saveDir;
             this.priorities = priorities;
             this.resume = resume;
+
+            if (this.resume != null) {
+                try {
+                    Entry resumeEntry = Entry.bdecode(this.resume);
+                    final Map<String, Entry> resumeDict = resumeEntry.dictionary();
+
+                    if (resumeDict.containsKey("paused")) {
+                        paused = ((Entry) resumeDict.get("paused")).integer() == 1;
+                    }
+
+                    // Force seed_mode to 1 and to not be auto_managed
+                    if (!paused && resumeDict.containsKey("seed_mode")) {
+                        Entry seedModeEntry = resumeDict.get("seed_mode");
+                        resumeDict.put("seed_mode", new Entry(1));
+                        resumeDict.put("auto_managed", new Entry(0));
+                        resumeEntry = Entry.fromMap(resumeDict);
+                        FileOutputStream fos = new FileOutputStream(this.resume);
+                        fos.write(resumeEntry.bencode());
+                        fos.flush();
+                        fos.close();
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
         }
 
-        @Override
         public void run() {
-            session.asyncAddTorrent(new TorrentInfo(torrent), saveDir, priorities, resume);
+            TorrentInfo tinfo = new TorrentInfo(torrent);
+            final TorrentHandle torrent = session.findTorrent(tinfo.getInfoHash());
+
+            if (torrent == null) {
+                final TorrentHandle torrentHandle = session.addTorrent(tinfo, saveDir, priorities, resume);
+                if (torrentHandle != null) {
+                    handlePreviouslyAddedTorrent(tinfo, torrentHandle);
+                } else {
+                    restoreDownloadsQueue.add(this); //add me back to the queue.
+                }
+            } else {
+                handlePreviouslyAddedTorrent(tinfo, torrent);
+            }
+
+            if (!restoreDownloadsQueue.isEmpty()) {
+                runNextRestoreDownloadTask();
+            }
+        }
+
+        private void handlePreviouslyAddedTorrent(TorrentInfo tinfo, TorrentHandle torrent) {
+            final TorrentStatus status = torrent.getStatus();
+            if (paused) {
+                torrent.pause();
+            } else {
+                if ((status.isFinished() && !status.isSeeding()) || !paused) {
+                    if (!paused) {
+                        System.out.println("No longer automanaged.");
+                        torrent.setAutoManaged(false);
+                    }
+                    torrent.resume();
+                } else if (status.getState() == TorrentStatus.State.CHECKING_RESUME_DATA) {
+                    restoreDownloadsQueue.add(this); //add me back to the queue.
+                }
+            }
         }
     }
 
